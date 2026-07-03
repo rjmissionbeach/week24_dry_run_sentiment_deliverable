@@ -21,6 +21,13 @@ except Exception:
 
 st.set_page_config(page_title="News Sentiment vs. Market Reaction", layout="wide")
 
+# Consistent sentiment colors across labels, counts, and timeline bars.
+SENTIMENT_COLORS = {
+    "positive": "#2ca02c",  # green
+    "neutral": "#f1c40f",   # yellow
+    "negative": "#d62728",  # red
+}
+
 
 # -----------------------------
 # Helpers for secrets / keys
@@ -57,7 +64,7 @@ def fetch_company_news(ticker: str, start_date: str, end_date: str, finnhub_key:
     return data
 
 
-def normalize_news(raw_news: list[dict], max_articles: int) -> pd.DataFrame:
+def normalize_news(raw_news: list[dict], max_articles: int, latest_usable_date=None) -> pd.DataFrame:
     rows = []
     for item in raw_news:
         unix_time = item.get("datetime")
@@ -80,7 +87,13 @@ def normalize_news(raw_news: list[dict], max_articles: int) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Newest first, then keep the user-selected number of articles.
+    # Newest first, but optionally exclude articles that are too recent to have
+    # an observable future return. This matters because the assignment asks for
+    # "what happened afterward"; news from today/yesterday often cannot be tested yet.
+    if latest_usable_date is not None:
+        latest_usable_date = pd.to_datetime(latest_usable_date).date()
+        df = df[df["published_date"] <= latest_usable_date]
+
     df = df.sort_values("published_datetime", ascending=False).head(max_articles).reset_index(drop=True)
     df["article_number"] = range(1, len(df) + 1)
     return df
@@ -268,6 +281,14 @@ def align_sentiment_to_prices(daily_sentiment: pd.DataFrame, prices: pd.DataFram
 def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame):
     fig = go.Figure()
 
+    bar_colors = aligned["predicted_direction"].map(
+        {
+            "up": SENTIMENT_COLORS["positive"],
+            "neutral": SENTIMENT_COLORS["neutral"],
+            "down": SENTIMENT_COLORS["negative"],
+        }
+    ).fillna(SENTIMENT_COLORS["neutral"])
+
     fig.add_trace(
         go.Scatter(
             x=prices["trading_date"],
@@ -283,7 +304,14 @@ def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame):
             y=aligned["avg_sentiment"],
             name="Average daily sentiment",
             yaxis="y2",
-            opacity=0.55,
+            opacity=0.65,
+            marker_color=bar_colors,
+            hovertemplate=(
+                "Date: %{x}<br>"
+                "Avg sentiment: %{y:.3f}<br>"
+                "Green = positive, yellow = neutral, red = negative"
+                "<extra></extra>"
+            ),
         )
     )
 
@@ -358,10 +386,18 @@ if run:
     start_str = start_dt.strftime("%Y-%m-%d")
     end_str = end_dt.strftime("%Y-%m-%d")
 
+    # To compute a future return, we need to avoid scoring articles that are too
+    # close to today. The buffer is deliberately calendar-day based and simple
+    # enough for students to explain. Users can still pull news through today;
+    # this only affects which articles are scored for the hit-rate exercise.
+    future_return_buffer_days = horizon_days + 3
+    latest_usable_news_date = end_dt - timedelta(days=future_return_buffer_days)
+
     try:
         with st.spinner("Pulling company news from Finnhub..."):
             raw_news = fetch_company_news(ticker, start_str, end_str, finnhub_key)
-            news_df = normalize_news(raw_news, max_articles)
+            all_news_df = normalize_news(raw_news, max_articles=10_000)
+            news_df = normalize_news(raw_news, max_articles, latest_usable_date=latest_usable_news_date)
 
         st.subheader("1. Finnhub company news checkpoint")
         c1, c2, c3 = st.columns(3)
@@ -369,8 +405,19 @@ if run:
         c2.metric("Articles returned by Finnhub", len(raw_news))
         c3.metric("Articles scored in this run", len(news_df))
 
+        if not all_news_df.empty:
+            too_recent_count = int((all_news_df["published_date"] > latest_usable_news_date).sum())
+            st.caption(
+                f"For the hit-rate test, the app scores articles published on or before "
+                f"{latest_usable_news_date}. It skipped {too_recent_count} newer article(s) because "
+                f"there may not be enough future trading data yet."
+            )
+
         if news_df.empty:
-            st.error("No usable news articles were returned for this ticker/date window. Try a larger company or a longer window.")
+            st.error(
+                "Finnhub returned news, but none of the articles are old enough to test against future price data. "
+                "Try a longer news window, a lower reaction horizon, or a higher-coverage ticker."
+            )
             st.stop()
 
         min_news_date = news_df["published_date"].min()
@@ -381,6 +428,11 @@ if run:
         )
         if len(raw_news) < max_articles:
             st.info("Finnhub returned fewer articles than requested by the slider. This is common for low-coverage tickers or short windows.")
+        elif len(news_df) < max_articles:
+            st.info(
+                "The app intentionally scored fewer articles than requested because some of the newest articles "
+                "were too recent to evaluate with a future price move."
+            )
 
         articles_for_model = []
         for _, row in news_df.iterrows():
@@ -408,17 +460,58 @@ if run:
 
         st.subheader("2. Sentiment-scored articles")
         display_cols = ["published_datetime", "source", "headline", "score", "label", "rationale", "url"]
-        st.dataframe(scored_news[display_cols], use_container_width=True, hide_index=True)
+
+        def color_sentiment_label(value):
+            color = SENTIMENT_COLORS.get(str(value).lower(), SENTIMENT_COLORS["neutral"])
+            return f"background-color: {color}; color: black; font-weight: 700;"
+
+        def color_sentiment_score(value):
+            try:
+                value = float(value)
+            except Exception:
+                value = 0.0
+            if value > neutral_cutoff:
+                color = SENTIMENT_COLORS["positive"]
+            elif value < -neutral_cutoff:
+                color = SENTIMENT_COLORS["negative"]
+            else:
+                color = SENTIMENT_COLORS["neutral"]
+            return f"background-color: {color}; color: black;"
+
+        styled_news = (
+            scored_news[display_cols]
+            .style
+            .applymap(color_sentiment_label, subset=["label"])
+            .applymap(color_sentiment_score, subset=["score"])
+            .format({"score": "{:.3f}"})
+        )
+        st.dataframe(styled_news, use_container_width=True, hide_index=True)
 
         st.subheader("3. Sentiment distribution")
         label_order = ["positive", "neutral", "negative"]
         dist = scored_news["label"].value_counts().reindex(label_order, fill_value=0).reset_index()
         dist.columns = ["label", "count"]
-        st.plotly_chart(px.bar(dist, x="label", y="count", title="Article Sentiment Counts"), use_container_width=True)
+        fig_dist = px.bar(
+            dist,
+            x="label",
+            y="count",
+            title="Article Sentiment Counts",
+            color="label",
+            color_discrete_map=SENTIMENT_COLORS,
+            category_orders={"label": label_order},
+        )
+        fig_dist.update_layout(showlegend=False)
+        st.plotly_chart(fig_dist, use_container_width=True)
 
         st.subheader("4. Price alignment and hit rate")
         if aligned.empty:
-            st.error("Could not align news sentiment to enough future price data. Try an earlier date window or a shorter horizon.")
+            st.error(
+                "Could not align the scored news sentiment to enough future price data. "
+                "This usually means the scored articles are still too close to the end of the price series. "
+                "Try a longer news window, fewer articles, or a shorter horizon."
+            )
+            st.write("Latest available price date:", prices["trading_date"].max())
+            st.write("Latest scored news date:", scored_news["published_date"].max())
             st.stop()
 
         directional = aligned[aligned["predicted_direction"].isin(["up", "down"])].copy()
@@ -433,9 +526,11 @@ if run:
                 help="Positive sentiment counts as a hit if the future return is positive; negative sentiment counts as a hit if the future return is negative. Neutral days are excluded.",
             )
 
+        skipped_days = max(0, len(daily_sentiment) - len(aligned))
         st.write(
             f"News on weekends or market holidays is rolled forward to the next available trading close. "
-            f"The future price move is measured over the next **{horizon_days}** trading day(s)."
+            f"The future price move is measured over the next **{horizon_days}** trading day(s). "
+            f"The alignment step skipped **{skipped_days}** news day(s) without enough future price data."
         )
         st.dataframe(
             aligned[[
@@ -456,9 +551,9 @@ if run:
         st.subheader("Submission notes you can paste/edit")
         st.markdown(
             f"""
-**Finnhub checkpoint:** For `{ticker}`, I requested up to {max_articles} articles over the last {days_back} days. Finnhub returned {len(raw_news)} raw articles, and the app scored {len(news_df)} newest usable articles. The scored article dates ranged from {min_news_date} to {max_news_date}. This shows that the app cannot assume the requested number of articles will actually be available, especially for low-coverage tickers or short date windows.
+**Finnhub checkpoint:** For `{ticker}`, I requested up to {max_articles} articles over the last {days_back} days. Finnhub returned {len(raw_news)} raw articles, and the app scored {len(news_df)} usable articles published on or before {latest_usable_news_date}. The scored article dates ranged from {min_news_date} to {max_news_date}. This shows that the app cannot assume the requested number of articles will actually be available or usable for a future-return test, especially for low-coverage tickers, short date windows, or very recent news.
 
-**Non-trading-day handling:** I grouped articles by calendar publication date. If a news date was not a trading day, I rolled it forward to the next available trading close rather than dropping it. I then compared that close to the close {horizon_days} trading day(s) later. This avoids crashes on weekends/holidays and keeps the rule consistent across tickers.
+**Non-trading-day handling:** I grouped articles by calendar publication date. If a news date was not a trading day, I rolled it forward to the next available trading close rather than dropping it. I then compared that close to the close {horizon_days} trading day(s) later. I also avoided scoring articles too close to today because there may not be enough future trading data yet. This avoids crashes on weekends/holidays and keeps the rule consistent across tickers.
             """
         )
 
