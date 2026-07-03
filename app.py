@@ -87,13 +87,10 @@ def normalize_news(raw_news: list[dict], max_articles: int, latest_usable_date=N
     if df.empty:
         return df
 
-    # Newest first, but optionally exclude articles that are too recent to have
-    # an observable future return. This matters because the assignment asks for
-    # "what happened afterward"; news from today/yesterday often cannot be tested yet.
-    if latest_usable_date is not None:
-        latest_usable_date = pd.to_datetime(latest_usable_date).date()
-        df = df[df["published_date"] <= latest_usable_date]
-
+    # Newest first. We do NOT discard recent articles here. Some very recent
+    # articles may not have future price data yet, but they are still useful for
+    # the article list, sentiment distribution, and timeline. The hit-rate
+    # calculation handles future-price availability row by row.
     df = df.sort_values("published_datetime", ascending=False).head(max_articles).reset_index(drop=True)
     df["article_number"] = range(1, len(df) + 1)
     return df
@@ -228,6 +225,12 @@ def compute_daily_sentiment(scored_news: pd.DataFrame) -> pd.DataFrame:
 
 
 def align_sentiment_to_prices(daily_sentiment: pd.DataFrame, prices: pd.DataFrame, horizon_days: int, neutral_cutoff: float) -> pd.DataFrame:
+    """Align daily sentiment to prices.
+
+    Important teaching choice: we keep a row even when there is not yet enough
+    future price data. Those rows can still be charted, but they are excluded
+    from the directional hit-rate calculation.
+    """
     rows = []
     trading_dates = list(prices["trading_date"])
 
@@ -235,28 +238,40 @@ def align_sentiment_to_prices(daily_sentiment: pd.DataFrame, prices: pd.DataFram
         news_date = row["published_date"]
         possible_anchor_dates = [d for d in trading_dates if d >= news_date]
         if not possible_anchor_dates:
+            # This can happen if Finnhub has news dated after the most recent
+            # available yfinance close. There is nothing to plot against.
             continue
 
         anchor_date = possible_anchor_dates[0]
         anchor_idx = prices.index[prices["trading_date"] == anchor_date][0]
         future_idx = anchor_idx + horizon_days
-        if future_idx >= len(prices):
-            continue
 
         anchor_close = float(prices.loc[anchor_idx, "close"])
-        future_date = prices.loc[future_idx, "trading_date"]
-        future_close = float(prices.loc[future_idx, "close"])
-        future_return = future_close / anchor_close - 1
         avg_sentiment = float(row["avg_sentiment"])
 
         if avg_sentiment > neutral_cutoff:
             predicted_direction = "up"
-            hit = future_return > 0
         elif avg_sentiment < -neutral_cutoff:
             predicted_direction = "down"
-            hit = future_return < 0
         else:
             predicted_direction = "neutral"
+
+        has_future_price = future_idx < len(prices)
+        if has_future_price:
+            future_date = prices.loc[future_idx, "trading_date"]
+            future_close = float(prices.loc[future_idx, "close"])
+            future_return = future_close / anchor_close - 1
+
+            if predicted_direction == "up":
+                hit = future_return > 0
+            elif predicted_direction == "down":
+                hit = future_return < 0
+            else:
+                hit = None
+        else:
+            future_date = None
+            future_close = None
+            future_return = None
             hit = None
 
         rows.append(
@@ -271,12 +286,12 @@ def align_sentiment_to_prices(daily_sentiment: pd.DataFrame, prices: pd.DataFram
                 "future_return": future_return,
                 "predicted_direction": predicted_direction,
                 "hit": hit,
+                "has_future_price": has_future_price,
                 "rolled_forward": anchor_date != news_date,
             }
         )
 
     return pd.DataFrame(rows)
-
 
 def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame, neutral_cutoff: float):
     fig = go.Figure()
@@ -423,18 +438,11 @@ if run:
     start_str = start_dt.strftime("%Y-%m-%d")
     end_str = end_dt.strftime("%Y-%m-%d")
 
-    # To compute a future return, we need to avoid scoring articles that are too
-    # close to today. The buffer is deliberately calendar-day based and simple
-    # enough for students to explain. Users can still pull news through today;
-    # this only affects which articles are scored for the hit-rate exercise.
-    future_return_buffer_days = horizon_days + 3
-    latest_usable_news_date = end_dt - timedelta(days=future_return_buffer_days)
-
     try:
         with st.spinner("Pulling company news from Finnhub..."):
             raw_news = fetch_company_news(ticker, start_str, end_str, finnhub_key)
             all_news_df = normalize_news(raw_news, max_articles=10_000)
-            news_df = normalize_news(raw_news, max_articles, latest_usable_date=latest_usable_news_date)
+            news_df = normalize_news(raw_news, max_articles)
 
         st.subheader("1. Finnhub company news checkpoint")
         c1, c2, c3 = st.columns(3)
@@ -443,18 +451,14 @@ if run:
         c3.metric("Articles scored in this run", len(news_df))
 
         if not all_news_df.empty:
-            too_recent_count = int((all_news_df["published_date"] > latest_usable_news_date).sum())
             st.caption(
-                f"For the hit-rate test, the app scores articles published on or before "
-                f"{latest_usable_news_date}. It skipped {too_recent_count} newer article(s) because "
-                f"there may not be enough future trading data yet."
+                "The app scores the newest articles returned by Finnhub. Very recent articles are still shown in the "
+                "article list and sentiment charts; if they do not yet have enough future trading data, they are excluded "
+                "only from the hit-rate calculation."
             )
 
         if news_df.empty:
-            st.error(
-                "Finnhub returned news, but none of the articles are old enough to test against future price data. "
-                "Try a longer news window, a lower reaction horizon, or a higher-coverage ticker."
-            )
+            st.error("Finnhub returned no usable articles for this ticker and date window.")
             st.stop()
 
         min_news_date = news_df["published_date"].min()
@@ -465,11 +469,6 @@ if run:
         )
         if len(raw_news) < max_articles:
             st.info("Finnhub returned fewer articles than requested by the slider. This is common for low-coverage tickers or short windows.")
-        elif len(news_df) < max_articles:
-            st.info(
-                "The app intentionally scored fewer articles than requested because some of the newest articles "
-                "were too recent to evaluate with a future price move."
-            )
 
         articles_for_model = []
         for _, row in news_df.iterrows():
@@ -543,24 +542,29 @@ if run:
         st.subheader("4. Price alignment and hit rate")
         if aligned.empty:
             st.error(
-                "Could not align the scored news sentiment to enough future price data. "
-                "This usually means the scored articles are still too close to the end of the price series. "
-                "Try a longer news window, fewer articles, or a shorter horizon."
+                "The app scored articles, but none could be matched to an available trading close. "
+                "This can happen when news dates are newer than the latest yfinance price date."
             )
             st.write("Latest available price date:", prices["trading_date"].max())
             st.write("Latest scored news date:", scored_news["published_date"].max())
             st.stop()
 
-        directional = aligned[aligned["predicted_direction"].isin(["up", "down"])].copy()
+        directional = aligned[(aligned["predicted_direction"].isin(["up", "down"])) & (aligned["has_future_price"] == True)].copy()
         if directional.empty:
             # Fallback for demos: if the cutoff is too strict, use the raw sign of
             # average sentiment so the app can still illustrate the hit-rate idea.
-            weak_directional = aligned[aligned["avg_sentiment"].abs() > 0].copy()
+            weak_directional = aligned[(aligned["avg_sentiment"].abs() > 0) & (aligned["has_future_price"] == True)].copy()
             if weak_directional.empty:
-                st.warning(
-                    "All usable daily sentiment averages were exactly neutral, so no directional hit rate was computed. "
-                    "The timeline below still shows the neutral sentiment days as yellow points."
-                )
+                if not aligned[aligned["has_future_price"] == True].empty:
+                    st.warning(
+                        "All daily sentiment averages with future price data were exactly neutral, so no directional hit rate was computed. "
+                        "The timeline below still shows the sentiment days as colored points."
+                    )
+                else:
+                    st.warning(
+                        "The app can show article sentiment and the price/sentiment timeline, but none of the scored news days have enough future price data yet to compute a hit rate. "
+                        "Try a longer news window or rerun after more trading days have passed."
+                    )
                 hit_rate = None
             else:
                 weak_directional["weak_hit"] = weak_directional.apply(
@@ -585,16 +589,18 @@ if run:
                 help="Positive sentiment counts as a hit if the future return is positive; negative sentiment counts as a hit if the future return is negative. Neutral days are excluded.",
             )
 
-        skipped_days = max(0, len(daily_sentiment) - len(aligned))
+        unmatched_days = max(0, len(daily_sentiment) - len(aligned))
+        no_future_days = int((aligned["has_future_price"] == False).sum()) if not aligned.empty else 0
         st.write(
             f"News on weekends or market holidays is rolled forward to the next available trading close. "
             f"The future price move is measured over the next **{horizon_days}** trading day(s). "
-            f"The alignment step skipped **{skipped_days}** news day(s) without enough future price data."
+            f"The alignment step could not match **{unmatched_days}** news day(s) to a trading close and found "
+            f"**{no_future_days}** matched news day(s) without enough future price data for the hit-rate calculation."
         )
         st.dataframe(
             aligned[[
                 "news_date", "trading_date_used", "future_date", "article_count", "avg_sentiment",
-                "predicted_direction", "future_return", "hit", "rolled_forward"
+                "predicted_direction", "future_return", "hit", "has_future_price", "rolled_forward"
             ]],
             use_container_width=True,
             hide_index=True,
@@ -610,9 +616,9 @@ if run:
         st.subheader("Submission notes you can paste/edit")
         st.markdown(
             f"""
-**Finnhub checkpoint:** For `{ticker}`, I requested up to {max_articles} articles over the last {days_back} days. Finnhub returned {len(raw_news)} raw articles, and the app scored {len(news_df)} usable articles published on or before {latest_usable_news_date}. The scored article dates ranged from {min_news_date} to {max_news_date}. This shows that the app cannot assume the requested number of articles will actually be available or usable for a future-return test, especially for low-coverage tickers, short date windows, or very recent news.
+**Finnhub checkpoint:** For `{ticker}`, I requested up to {max_articles} articles over the last {days_back} days. Finnhub returned {len(raw_news)} raw articles, and the app scored {len(news_df)} articles. The scored article dates ranged from {min_news_date} to {max_news_date}. This shows that the app cannot assume the requested number of articles will actually be available, and it also shows that recently published articles may not yet be usable for a future-return hit-rate test.
 
-**Non-trading-day handling:** I grouped articles by calendar publication date. If a news date was not a trading day, I rolled it forward to the next available trading close rather than dropping it. I then compared that close to the close {horizon_days} trading day(s) later. I also avoided scoring articles too close to today because there may not be enough future trading data yet. This avoids crashes on weekends/holidays and keeps the rule consistent across tickers.
+**Non-trading-day handling:** I grouped articles by calendar publication date. If a news date was not a trading day, I rolled it forward to the next available trading close rather than dropping it. I then compared that close to the close {horizon_days} trading day(s) later when that future price was available. If the article was too recent to have a future price yet, I kept it in the sentiment charts but excluded it from the hit-rate calculation. This avoids crashes on weekends/holidays and keeps the rule consistent across tickers.
             """
         )
 
