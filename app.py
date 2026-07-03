@@ -50,8 +50,8 @@ def clean_ticker(ticker: str) -> str:
 # -----------------------------
 # Finnhub company news
 # -----------------------------
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def fetch_company_news(ticker: str, start_date: str, end_date: str, finnhub_key: str) -> list[dict]:
+def _fetch_company_news_once(ticker: str, start_date: str, end_date: str, finnhub_key: str) -> list[dict]:
+    """One Finnhub company-news request for a specific date slice."""
     url = "https://finnhub.io/api/v1/company-news"
     params = {"symbol": ticker, "from": start_date, "to": end_date}
     headers = {"X-Finnhub-Token": finnhub_key}
@@ -62,6 +62,48 @@ def fetch_company_news(ticker: str, start_date: str, end_date: str, finnhub_key:
     if not isinstance(data, list):
         raise ValueError(f"Finnhub returned an unexpected response: {data}")
     return data
+
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def fetch_company_news(ticker: str, start_date: str, end_date: str, finnhub_key: str) -> list[dict]:
+    """Fetch company news across the requested window using small slices.
+
+    In practice, broad Finnhub company-news requests can behave like "give me
+    the latest results" for high-coverage tickers, which may mean a 30-day
+    request still produces articles clustered in only a few recent days. For
+    this assignment we want students to verify date coverage, so the app asks
+    Finnhub for the same overall window in 7-day chunks and deduplicates the
+    results.
+    """
+    start = pd.to_datetime(start_date).date()
+    end = pd.to_datetime(end_date).date()
+
+    all_items = []
+    current = start
+    chunk_days = 7
+    while current <= end:
+        chunk_end = min(current + timedelta(days=chunk_days - 1), end)
+        all_items.extend(
+            _fetch_company_news_once(
+                ticker,
+                current.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+                finnhub_key,
+            )
+        )
+        current = chunk_end + timedelta(days=1)
+
+    # Deduplicate. Some vendors return duplicate syndicated stories or overlap
+    # boundary dates across requests. Prefer Finnhub id; fall back to url/headline/time.
+    seen = set()
+    deduped = []
+    for item in all_items:
+        key = item.get("id") or item.get("url") or (item.get("headline"), item.get("datetime"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def normalize_news(raw_news: list[dict], max_articles: int, latest_usable_date=None) -> pd.DataFrame:
@@ -90,21 +132,33 @@ def normalize_news(raw_news: list[dict], max_articles: int, latest_usable_date=N
     # Sort newest first, but do not blindly take the newest N articles.
     # For high-coverage tickers, the newest 12 articles may all be from today,
     # which means there is no later trading close available for the hit-rate test.
-    # Instead, choose articles spread across the returned window. This still feels
-    # like "recent news" while giving the price-alignment section enough dates
-    # to work with during a class dry run.
+    # Instead, first spread the selection across distinct publication dates, then
+    # fill any remaining slots. This makes the displayed news date span match the
+    # user's requested window much better.
     df = df.sort_values("published_datetime", ascending=False).reset_index(drop=True)
     if len(df) > max_articles:
-        positions = [round(i * (len(df) - 1) / (max_articles - 1)) for i in range(max_articles)] if max_articles > 1 else [0]
-        positions = sorted(set(positions))
-        # If rounding produced duplicates, fill from the newest remaining articles.
-        if len(positions) < max_articles:
-            for pos in range(len(df)):
-                if pos not in positions:
-                    positions.append(pos)
-                if len(positions) == max_articles:
-                    break
-        df = df.iloc[sorted(positions)].copy()
+        selected_idx = []
+        unique_dates = sorted(df["published_date"].unique(), reverse=True)
+
+        if len(unique_dates) >= max_articles:
+            date_positions = [round(i * (len(unique_dates) - 1) / (max_articles - 1)) for i in range(max_articles)] if max_articles > 1 else [0]
+            chosen_dates = [unique_dates[pos] for pos in sorted(set(date_positions))]
+            for d in chosen_dates:
+                # newest article on that date
+                selected_idx.append(df.index[df["published_date"] == d][0])
+        else:
+            # Start with the newest article from every available news date.
+            for d in unique_dates:
+                selected_idx.append(df.index[df["published_date"] == d][0])
+
+        # Fill remaining slots with the newest not-yet-selected articles.
+        for idx in df.index:
+            if len(selected_idx) >= max_articles:
+                break
+            if idx not in selected_idx:
+                selected_idx.append(idx)
+
+        df = df.loc[selected_idx[:max_articles]].copy()
     df = df.sort_values("published_datetime", ascending=False).reset_index(drop=True)
     df["article_number"] = range(1, len(df) + 1)
     return df
@@ -465,10 +519,12 @@ if run:
         c3.metric("Articles scored in this run", len(news_df))
 
         if not all_news_df.empty:
+            raw_min_date = all_news_df["published_date"].min()
+            raw_max_date = all_news_df["published_date"].max()
             st.caption(
-                "The app scores articles spread across the Finnhub date window, rather than only the newest articles. Very recent articles are still shown in the "
-                "article list and sentiment charts; if they do not yet have enough future trading data, they are excluded "
-                "only from the hit-rate calculation."
+                f"Finnhub raw article dates returned: **{raw_min_date}** to **{raw_max_date}**. "
+                f"The requested date window was **{start_str}** to **{end_str}**. "
+                "The app requests Finnhub news in 7-day slices, deduplicates results, and then scores articles spread across distinct publication dates rather than only the newest cluster."
             )
 
         if news_df.empty:
@@ -478,8 +534,8 @@ if run:
         min_news_date = news_df["published_date"].min()
         max_news_date = news_df["published_date"].max()
         st.write(
-            f"For **{ticker}**, Finnhub returned **{len(raw_news)}** raw articles from **{start_str}** to **{end_str}**. "
-            f"This app scored **{len(news_df)}** articles spread across the returned date window. The scored articles range from **{min_news_date}** to **{max_news_date}**."
+            f"For **{ticker}**, Finnhub returned **{len(raw_news)}** raw articles from **{start_str}** to **{end_str}** after chunked requests and deduplication. "
+            f"This app scored **{len(news_df)}** articles spread across distinct returned news dates. The scored articles range from **{min_news_date}** to **{max_news_date}**."
         )
         if len(raw_news) < max_articles:
             st.info("Finnhub returned fewer articles than requested by the slider. This is common for low-coverage tickers or short windows.")
@@ -630,7 +686,7 @@ if run:
         st.subheader("Submission notes you can paste/edit")
         st.markdown(
             f"""
-**Finnhub checkpoint:** For `{ticker}`, I requested up to {max_articles} articles over the last {days_back} days. Finnhub returned {len(raw_news)} raw articles, and the app scored {len(news_df)} articles. The scored article dates ranged from {min_news_date} to {max_news_date}. This shows that the app cannot assume the requested number of articles will actually be available, and it also shows that recently published articles may not yet be usable for a future-return hit-rate test.
+**Finnhub checkpoint:** For `{ticker}`, I requested up to {max_articles} articles over the last {days_back} days. The app queried Finnhub in 7-day slices across the full window, deduplicated the results, and Finnhub returned {len(raw_news)} raw articles. The app scored {len(news_df)} articles spread across distinct publication dates. The scored article dates ranged from {min_news_date} to {max_news_date}. This shows that the app cannot assume the requested number of articles will actually be available or evenly distributed across the requested window, and it also shows that recently published articles may not yet be usable for a future-return hit-rate test.
 
 **Non-trading-day handling:** I grouped articles by calendar publication date. If a news date was not a trading day, I rolled it forward to the next available trading close rather than dropping it. I then compared that close to the close {horizon_days} trading day(s) later when that future price was available. If the article was too recent to have a future price yet, I kept it in the sentiment charts but excluded it from the hit-rate calculation. This avoids crashes on weekends/holidays and keeps the rule consistent across tickers.
             """
