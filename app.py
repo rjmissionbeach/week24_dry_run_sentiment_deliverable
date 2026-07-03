@@ -87,11 +87,25 @@ def normalize_news(raw_news: list[dict], max_articles: int, latest_usable_date=N
     if df.empty:
         return df
 
-    # Newest first. We do NOT discard recent articles here. Some very recent
-    # articles may not have future price data yet, but they are still useful for
-    # the article list, sentiment distribution, and timeline. The hit-rate
-    # calculation handles future-price availability row by row.
-    df = df.sort_values("published_datetime", ascending=False).head(max_articles).reset_index(drop=True)
+    # Sort newest first, but do not blindly take the newest N articles.
+    # For high-coverage tickers, the newest 12 articles may all be from today,
+    # which means there is no later trading close available for the hit-rate test.
+    # Instead, choose articles spread across the returned window. This still feels
+    # like "recent news" while giving the price-alignment section enough dates
+    # to work with during a class dry run.
+    df = df.sort_values("published_datetime", ascending=False).reset_index(drop=True)
+    if len(df) > max_articles:
+        positions = [round(i * (len(df) - 1) / (max_articles - 1)) for i in range(max_articles)] if max_articles > 1 else [0]
+        positions = sorted(set(positions))
+        # If rounding produced duplicates, fill from the newest remaining articles.
+        if len(positions) < max_articles:
+            for pos in range(len(df)):
+                if pos not in positions:
+                    positions.append(pos)
+                if len(positions) == max_articles:
+                    break
+        df = df.iloc[sorted(positions)].copy()
+    df = df.sort_values("published_datetime", ascending=False).reset_index(drop=True)
     df["article_number"] = range(1, len(df) + 1)
     return df
 
@@ -452,7 +466,7 @@ if run:
 
         if not all_news_df.empty:
             st.caption(
-                "The app scores the newest articles returned by Finnhub. Very recent articles are still shown in the "
+                "The app scores articles spread across the Finnhub date window, rather than only the newest articles. Very recent articles are still shown in the "
                 "article list and sentiment charts; if they do not yet have enough future trading data, they are excluded "
                 "only from the hit-rate calculation."
             )
@@ -465,7 +479,7 @@ if run:
         max_news_date = news_df["published_date"].max()
         st.write(
             f"For **{ticker}**, Finnhub returned **{len(raw_news)}** raw articles from **{start_str}** to **{end_str}**. "
-            f"This app scored the newest **{len(news_df)}** articles. The scored articles range from **{min_news_date}** to **{max_news_date}**."
+            f"This app scored **{len(news_df)}** articles spread across the returned date window. The scored articles range from **{min_news_date}** to **{max_news_date}**."
         )
         if len(raw_news) < max_articles:
             st.info("Finnhub returned fewer articles than requested by the slider. This is common for low-coverage tickers or short windows.")
