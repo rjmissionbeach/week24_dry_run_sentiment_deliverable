@@ -278,10 +278,19 @@ def align_sentiment_to_prices(daily_sentiment: pd.DataFrame, prices: pd.DataFram
     return pd.DataFrame(rows)
 
 
-def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame):
+def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame, neutral_cutoff: float):
     fig = go.Figure()
 
-    bar_colors = aligned["predicted_direction"].map(
+    def direction_from_score(x):
+        if x > neutral_cutoff:
+            return "up"
+        if x < -neutral_cutoff:
+            return "down"
+        return "neutral"
+
+    chart_df = aligned.copy()
+    chart_df["chart_direction"] = chart_df["avg_sentiment"].apply(direction_from_score)
+    bar_colors = chart_df["chart_direction"].map(
         {
             "up": SENTIMENT_COLORS["positive"],
             "neutral": SENTIMENT_COLORS["neutral"],
@@ -298,13 +307,17 @@ def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame):
             yaxis="y1",
         )
     )
+
+    # Bars are useful when sentiment is away from zero, but neutral days have
+    # zero-height bars. Add markers too, so daily sentiment still appears even
+    # when the average is exactly or nearly neutral.
     fig.add_trace(
         go.Bar(
-            x=aligned["trading_date_used"],
-            y=aligned["avg_sentiment"],
-            name="Average daily sentiment",
+            x=chart_df["trading_date_used"],
+            y=chart_df["avg_sentiment"],
+            name="Average daily sentiment (bar)",
             yaxis="y2",
-            opacity=0.65,
+            opacity=0.55,
             marker_color=bar_colors,
             hovertemplate=(
                 "Date: %{x}<br>"
@@ -314,6 +327,24 @@ def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame):
             ),
         )
     )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df["trading_date_used"],
+            y=chart_df["avg_sentiment"],
+            name="Daily sentiment point",
+            mode="markers",
+            yaxis="y2",
+            marker=dict(size=11, color=bar_colors, line=dict(width=1, color="black")),
+            hovertemplate=(
+                "Date: %{x}<br>"
+                "Avg sentiment: %{y:.3f}<br>"
+                "Articles: %{customdata}<extra></extra>"
+            ),
+            customdata=chart_df["article_count"],
+        )
+    )
+
+    fig.add_hline(y=0, line_dash="dot", line_width=1, yref="y2")
 
     fig.update_layout(
         title="Price and News Sentiment Timeline",
@@ -324,7 +355,6 @@ def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame):
         height=500,
     )
     return fig
-
 
 def show_wordcloud(scored_news: pd.DataFrame):
     if not WORDCLOUD_AVAILABLE:
@@ -358,7 +388,14 @@ with st.sidebar:
     days_back = st.slider("News window: days back", min_value=7, max_value=90, value=30, step=1)
     max_articles = st.slider("Articles to score", min_value=3, max_value=30, value=12, step=1)
     horizon_days = st.slider("Price reaction horizon: trading days", min_value=1, max_value=3, value=1, step=1)
-    neutral_cutoff = st.slider("Neutral cutoff for daily sentiment", min_value=0.00, max_value=0.25, value=0.05, step=0.01)
+    neutral_cutoff = st.slider(
+        "Neutral cutoff for daily sentiment",
+        min_value=0.00,
+        max_value=0.25,
+        value=0.00,
+        step=0.01,
+        help="Use 0.00 for the class demo so any nonzero daily average gives a direction. Increase it if you want only stronger sentiment days to count."
+    )
     model = st.text_input("OpenRouter model", value="openai/gpt-4o-mini")
     show_grad_wordcloud = st.checkbox("Show graduate word cloud extension", value=True)
 
@@ -516,8 +553,30 @@ if run:
 
         directional = aligned[aligned["predicted_direction"].isin(["up", "down"])].copy()
         if directional.empty:
-            st.warning("All daily sentiment averages were neutral under the current cutoff, so no directional hit rate was computed.")
-            hit_rate = None
+            # Fallback for demos: if the cutoff is too strict, use the raw sign of
+            # average sentiment so the app can still illustrate the hit-rate idea.
+            weak_directional = aligned[aligned["avg_sentiment"].abs() > 0].copy()
+            if weak_directional.empty:
+                st.warning(
+                    "All usable daily sentiment averages were exactly neutral, so no directional hit rate was computed. "
+                    "The timeline below still shows the neutral sentiment days as yellow points."
+                )
+                hit_rate = None
+            else:
+                weak_directional["weak_hit"] = weak_directional.apply(
+                    lambda r: (r["future_return"] > 0) if r["avg_sentiment"] > 0 else (r["future_return"] < 0),
+                    axis=1,
+                )
+                hit_rate = weak_directional["weak_hit"].mean()
+                st.metric(
+                    "Weak-sign hit rate",
+                    f"{hit_rate:.1%}",
+                    help="The neutral cutoff was too strict, so this fallback uses the raw sign of the daily average sentiment."
+                )
+                st.info(
+                    "The cutoff classified every day as neutral. For teaching purposes, the app computed a weak-sign hit rate using the raw positive/negative sign of average sentiment. "
+                    "Move the neutral cutoff to 0.00 to make this the primary rule."
+                )
         else:
             hit_rate = directional["hit"].mean()
             st.metric(
@@ -542,7 +601,7 @@ if run:
         )
 
         st.subheader("5. Price and sentiment timeline")
-        st.plotly_chart(make_combined_chart(aligned, prices), use_container_width=True)
+        st.plotly_chart(make_combined_chart(aligned, prices, neutral_cutoff), use_container_width=True)
 
         if show_grad_wordcloud:
             st.subheader("Graduate extension: word cloud")
