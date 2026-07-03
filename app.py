@@ -481,8 +481,8 @@ if run:
         styled_news = (
             scored_news[display_cols]
             .style
-            .applymap(color_sentiment_label, subset=["label"])
-            .applymap(color_sentiment_score, subset=["score"])
+            .map(color_sentiment_label, subset=["label"])
+            .map(color_sentiment_score, subset=["score"])
             .format({"score": "{:.3f}"})
         )
         st.dataframe(styled_news, use_container_width=True, hide_index=True)
