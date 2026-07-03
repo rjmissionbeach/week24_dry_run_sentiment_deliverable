@@ -47,6 +47,24 @@ def clean_ticker(ticker: str) -> str:
     return ticker.strip().upper()
 
 
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def get_company_display_name(ticker: str) -> str:
+    """Return a readable company name for the page header, falling back to ticker."""
+    ticker = clean_ticker(ticker)
+    if not ticker:
+        return "Selected Company"
+
+    try:
+        info = yf.Ticker(ticker).info
+        name = info.get("longName") or info.get("shortName")
+        if name:
+            return str(name)
+    except Exception:
+        pass
+
+    return ticker
+
+
 # -----------------------------
 # Finnhub company news
 # -----------------------------
@@ -361,7 +379,7 @@ def align_sentiment_to_prices(daily_sentiment: pd.DataFrame, prices: pd.DataFram
 
     return pd.DataFrame(rows)
 
-def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame, neutral_cutoff: float):
+def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame, neutral_cutoff: float, chart_title: str = "Price and News Sentiment Timeline"):
     fig = go.Figure()
 
     def direction_from_score(x):
@@ -430,7 +448,7 @@ def make_combined_chart(aligned: pd.DataFrame, prices: pd.DataFrame, neutral_cut
     fig.add_hline(y=0, line_dash="dot", line_width=1, yref="y2")
 
     fig.update_layout(
-        title="Price and News Sentiment Timeline",
+        title=chart_title,
         xaxis_title="Date",
         yaxis=dict(title="Adjusted close"),
         yaxis2=dict(title="Sentiment", overlaying="y", side="right", range=[-1, 1]),
@@ -459,11 +477,8 @@ def show_wordcloud(scored_news: pd.DataFrame):
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.title("News Sentiment vs. Market Reaction")
-st.write(
-    "Enter a ticker, pull recent Finnhub company news, score sentiment with OpenRouter, "
-    "and compare the signal to the stock's next trading-day price movement."
-)
+title_placeholder = st.empty()
+intro_placeholder = st.empty()
 
 with st.sidebar:
     st.header("Settings")
@@ -488,6 +503,13 @@ with st.sidebar:
     openrouter_key = get_secret("OPENROUTER_API_KEY")
     st.write("Finnhub key:", "✅ found" if finnhub_key else "❌ missing")
     st.write("OpenRouter key:", "✅ found" if openrouter_key else "❌ missing")
+
+company_display_name = get_company_display_name(ticker) if ticker else "Selected Company"
+title_placeholder.title(f"News Sentiment for {company_display_name} vs. Market Reaction")
+intro_placeholder.write(
+    f"Ticker: **{ticker}**. Pull recent Finnhub company news, score sentiment with OpenRouter, "
+    "and compare the signal to the stock's next trading-day price movement."
+)
 
 run = st.button("Run analysis", type="primary", disabled=not ticker)
 
@@ -677,7 +699,7 @@ if run:
         )
 
         st.subheader("5. Price and sentiment timeline")
-        st.plotly_chart(make_combined_chart(aligned, prices, neutral_cutoff), use_container_width=True)
+        st.plotly_chart(make_combined_chart(aligned, prices, neutral_cutoff, f"Price and News Sentiment Timeline for {company_display_name}"), use_container_width=True)
 
         if show_grad_wordcloud:
             st.subheader("Graduate extension: word cloud")
